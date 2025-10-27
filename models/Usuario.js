@@ -12,7 +12,8 @@ const usuarioSchema = new mongoose.Schema({
   preguntaSecreta: { type: String, required: true },
   respuestaSecreta: { type: String, required: true },
   rol: { type: String, enum: ["usuario", "admin"], default: "usuario" },
-});
+  verificado: { type: Boolean, default: false }, // <- importante
+}, { timestamps: true });
 
 usuarioSchema.methods.comparePassword = async function (password) {
   return bcrypt.compare(password, this.password);
