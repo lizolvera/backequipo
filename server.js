@@ -2,7 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const conectarDB = require("./config/db");
 require("dotenv").config();
-
+const morgan =require("morgan")
 // Importar las rutas
 const userRoutes = require("./routes/userRoutes");
 
@@ -20,6 +20,7 @@ app.use(
     credentials: true,
   })
 );
+app.use(morgan("dev"));
 
 // Conectar a la base de datos
 conectarDB();
@@ -28,7 +29,14 @@ conectarDB();
 app.get("/", (_req, res) => {
   res.send("API OK");
 });
-
+app.get("/api", (req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "¡Hola Mundo! ",
+    description: "API funcionando correctamente",
+    timestamp: new Date().toISOString(),
+  });
+});
 // Rutas API existentes
 app.use("/api/usuarios", userRoutes);
 

@@ -1,19 +1,19 @@
-// controllers/userController.js (Ampliado con 2FA, sin quitar tu lógica)
+// controllers/userController.js (FLUJO CORREGIDO)
 const Usuario = require("../models/Usuario");
 const bcrypt = require("bcryptjs");
 
-// === NUEVO: deps para 2FA ===
+// === Dependencies para 2FA ===
 const { v4: uuidv4 } = require("uuid");
 const nodemailer = require("nodemailer");
 
-// === NUEVO: store OTP temporal en memoria (en prod: Redis/DB) ===
-const otpStore = new Map(); // tempToken -> { email, codigo, expira, intentos }
+// === Store temporal para datos de registro pendientes ===
+const pendingRegistrations = new Map(); // tempToken -> { datosUsuario, codigo, expira, intentos }
 
-// === NUEVO: helpers 2FA ===
+// === Helpers 2FA ===
 const genCodigo = () => String(Math.floor(100000 + Math.random() * 900000));
 const maskEmail = (correo = "") => correo.replace(/(.{2}).+(@.+)/, "$1***$2");
 
-// Lee SMTP desde variables de entorno (.env)
+// Configuración de email
 async function getTransporter() {
   const {
     EMAIL_HOST,
@@ -23,16 +23,12 @@ async function getTransporter() {
     EMAIL_PASS,
   } = process.env;
 
-  // Transporter básico con SMTP real (Gmail/SendGrid/Mailgun/Office365)
   const transporter = nodemailer.createTransport({
     host: EMAIL_HOST,
     port: Number(EMAIL_PORT || 465),
     secure: (EMAIL_SECURE === "true"),
     auth: { user: EMAIL_USER, pass: EMAIL_PASS },
   });
-
-  // (opcional) verifica credenciales al levantar
-  // await transporter.verify();
 
   return transporter;
 }
@@ -56,153 +52,294 @@ async function enviarCodigoEmail({ to, codigo }) {
 }
 
 // ====================
-// Registrar un nuevo usuario (tu función original + 2FA)
+// INICIAR REGISTRO (solo validar y enviar código)
 // ====================
 const registerUser = async (req, res) => {
   try {
-    const { username, email, telefono } = req.body;
+    console.log("Solicitud de registro recibida:", req.body);
+    
+    // Mapeo: Campos del frontend → Modelo
+    const {
+      nombre,
+      apellidopaterno,
+      apellidomaterno,
+      correo,
+      contrasena,
+      telefono,
+      preguntasecreta,
+      respuestasecreta
+    } = req.body;
 
-    // Verificar si el nombre de usuario ya existe
-    const existingUsername = await Usuario.findOne({ username });
-    if (existingUsername) {
-      return res.status(400).json({ error: "El nombre de usuario ya está en uso" });
+    // Validación de campos requeridos
+    if (!nombre || !apellidopaterno || !apellidomaterno || !correo || !contrasena || !telefono || !preguntasecreta || !respuestasecreta) {
+      return res.status(400).json({ 
+        error: "Todos los campos son obligatorios" 
+      });
     }
 
-    // Verificar si el correo electrónico ya existe
-    const existingEmail = await Usuario.findOne({ email });
+    // Validación de formato de email
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(correo)) {
+      return res.status(400).json({ 
+        error: "Formato de correo electrónico inválido" 
+      });
+    }
+
+    // Validación de contraseña
+    const passRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[A-Za-z\d\S]{8,}$/;
+    if (!passRegex.test(contrasena)) {
+      return res.status(400).json({ 
+        error: "La contraseña debe tener al menos 8 caracteres, una mayúscula, una minúscula y un número" 
+      });
+    }
+
+    // Verificar si el correo ya existe EN LA BASE DE DATOS (usuarios ya registrados)
+    const existingEmail = await Usuario.findOne({ email: correo });
     if (existingEmail) {
-      return res.status(400).json({ error: "El correo electrónico ya está registrado" });
+      return res.status(400).json({ 
+        error: "El correo electrónico ya está registrado" 
+      });
     }
 
-    // Verificar si el número de teléfono ya existe
+    // Verificar si el teléfono ya existe
     const existingTelefono = await Usuario.findOne({ telefono });
     if (existingTelefono) {
-      return res.status(400).json({ error: "El número de teléfono ya está registrado" });
+      return res.status(400).json({ 
+        error: "El número de teléfono ya está registrado" 
+      });
     }
 
-    const { nombre, ap, am, password, preguntaSecreta, respuestaSecreta } = req.body;
-    const hashedPassword = await bcrypt.hash(password, 10);
+    // === IMPORTANTE: NO guardar en BD todavía ===
+    // Solo preparar datos y enviar código de verificación
 
-    const nuevoUsuario = new Usuario({
-      nombre,
-      ap,
-      am,
-      username,
-      email,
-      password: hashedPassword,
-      telefono,
-      preguntaSecreta,
-      respuestaSecreta,
-      // SUGERENCIA: si tu modelo tiene este campo, mejor marcarlo
-      // verificado: false,
-    });
+    // Preparar datos del usuario (sin guardar)
+    const userData = {
+      nombre: nombre,
+      ap: apellidopaterno,
+      am: apellidomaterno,
+      username: correo, // Usar email como username
+      email: correo,
+      password: contrasena, // Guardar temporalmente sin hashear
+      telefono: telefono,
+      preguntaSecreta: preguntasecreta,
+      respuestaSecreta: respuestasecreta, // Guardar temporalmente sin hashear
+      rol: "usuario"
+    };
 
-    await nuevoUsuario.save();
-
-    // === NUEVO: 2FA por correo ===
-    // Genera tempToken + código, guarda en store y envía por email
+    // Generar token temporal y código
     const tempToken = uuidv4();
     const codigo = genCodigo();
-    otpStore.set(tempToken, {
-      email,
-      codigo,
+
+    // Guardar en store temporal (NO en BD)
+    pendingRegistrations.set(tempToken, {
+      userData: userData,
+      codigo: codigo,
       expira: Date.now() + 5 * 60 * 1000, // 5 minutos
       intentos: 0,
     });
 
-    await enviarCodigoEmail({ to: email, codigo });
+    console.log(`Enviando código 2FA a: ${correo}`);
+    await enviarCodigoEmail({ to: correo, codigo: codigo });
 
-    // RESPUESTA: conservamos tu mensaje y usuario,
-    // y añadimos los campos del 2FA para el frontend
-    return res.status(201).json({
-      mensaje: "Usuario registrado con éxito",
-      usuario: nuevoUsuario,
+    // Respuesta al frontend - SOLO código enviado
+    return res.status(200).json({
+      success: true,
+      mensaje: "Código de verificación enviado. Revisa tu correo electrónico.",
       requires2fa: true,
       canal: "email",
-      destino: maskEmail(email),
-      tempToken,
+      destino: maskEmail(correo),
+      tempToken: tempToken,
     });
+
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Error al registrar usuario" });
+    console.error("Error en solicitud de registro:", error);
+    
+    res.status(500).json({ 
+      error: "Error interno del servidor: " + error.message 
+    });
   }
 };
 
 // ====================
-// NUEVO: Verificar código 2FA
-// body: { tempToken, codigo }
-// res: { ok: true }
+// VERIFICAR CÓDIGO 2FA Y REGISTRAR USUARIO
 // ====================
 const verificarRegistro2FA = async (req, res) => {
   try {
     const { tempToken, codigo } = req.body || {};
-    const data = otpStore.get(tempToken);
-    if (!data) {
-      return res.status(400).json({ error: "Sesión 2FA inválida" });
+    
+    if (!tempToken || !codigo) {
+      return res.status(400).json({ 
+        error: "Token y código son requeridos" 
+      });
     }
 
-    // Expirado
-    if (Date.now() > data.expira) {
-      otpStore.delete(tempToken);
-      return res.status(400).json({ error: "Código expirado" });
+    const pendingData = pendingRegistrations.get(tempToken);
+    if (!pendingData) {
+      return res.status(400).json({ 
+        error: "Sesión de verificación inválida o expirada" 
+      });
     }
 
-    // Incorrecto
-    if (String(codigo) !== String(data.codigo)) {
-      data.intentos = (data.intentos || 0) + 1;
-      if (data.intentos >= 5) {
-        otpStore.delete(tempToken);
-        return res.status(429).json({ error: "Demasiados intentos" });
+    // Verificar expiración
+    if (Date.now() > pendingData.expira) {
+      pendingRegistrations.delete(tempToken);
+      return res.status(400).json({ 
+        error: "Código expirado. Solicite uno nuevo." 
+      });
+    }
+
+    // Verificar código
+    if (String(codigo) !== String(pendingData.codigo)) {
+      pendingData.intentos = (pendingData.intentos || 0) + 1;
+      
+      if (pendingData.intentos >= 5) {
+        pendingRegistrations.delete(tempToken);
+        return res.status(429).json({ 
+          error: "Demasiados intentos fallidos. Registro cancelado." 
+        });
       }
-      return res.status(400).json({ error: "Código incorrecto" });
+      
+      return res.status(400).json({ 
+        error: `Código incorrecto. Intentos restantes: ${5 - pendingData.intentos}` 
+      });
     }
 
-    // Opcional: marcar usuario como verificado si tu modelo lo soporta
-    // await Usuario.updateOne({ email: data.email }, { $set: { verificado: true } });
+    // ✅ CÓDIGO CORRECTO - AHORA SÍ REGISTRAR EN BD
+    console.log("Código verificado. Registrando usuario en BD...");
 
-    otpStore.delete(tempToken);
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Error al verificar código" });
+    const userData = pendingData.userData;
+
+    // Hashear contraseña ANTES de guardar
+    const hashedPassword = await new Promise((resolve, reject) => {
+      bcrypt.hash(userData.password, 10, (err, hash) => {
+        if (err) {
+          reject(new Error("Error al procesar la contraseña"));
+        } else {
+          resolve(hash);
+        }
+      });
+    });
+
+    // Hashear respuesta secreta
+    const hashedRespuesta = await new Promise((resolve, reject) => {
+      bcrypt.hash(userData.respuestaSecreta, 10, (err, hash) => {
+        if (err) {
+          reject(new Error("Error al procesar la respuesta secreta"));
+        } else {
+          resolve(hash);
+        }
+      });
+    });
+
+    // Crear usuario con datos hasheados
+    const nuevoUsuario = new Usuario({
+      ...userData,
+      password: hashedPassword,
+      respuestaSecreta: hashedRespuesta,
+      verificado: true, // ← Marcado como verificado
+    });
+
+    // FINALMENTE guardar en base de datos
+    await nuevoUsuario.save();
+    console.log(`Usuario ${userData.email} registrado exitosamente`);
+
+    // Limpiar datos temporales
+    pendingRegistrations.delete(tempToken);
+
+    // Respuesta de éxito
+    return res.json({ 
+      success: true,
+      mensaje: "¡Registro completado exitosamente! Tu cuenta ha sido verificada y creada.",
+      usuario: {
+        id: nuevoUsuario._id,
+        nombre: nuevoUsuario.nombre,
+        email: nuevoUsuario.email,
+        verificado: nuevoUsuario.verificado
+      }
+    });
+
+  } catch (error) {
+    console.error("Error en verificación 2FA:", error);
+    
+    // Manejar errores de duplicados (por si acaso)
+    if (error.code === 11000) {
+      return res.status(400).json({ 
+        error: "El usuario ya fue registrado recientemente" 
+      });
+    }
+
+    res.status(500).json({ 
+      error: "Error interno al completar el registro: " + error.message 
+    });
   }
 };
 
 // ====================
-// NUEVO: Reenviar código 2FA
-// body: { tempToken }
-// res: { ok: true, canal, destino }
+// REENVIAR CÓDIGO 2FA
 // ====================
 const reenviarRegistro2FA = async (req, res) => {
   try {
     const { tempToken } = req.body || {};
-    const data = otpStore.get(tempToken);
-    if (!data) {
-      return res.status(400).json({ error: "Sesión 2FA inválida" });
+    
+    if (!tempToken) {
+      return res.status(400).json({ 
+        error: "Token requerido" 
+      });
     }
 
-    const nuevo = genCodigo();
-    otpStore.set(tempToken, {
-      email: data.email,
-      codigo: nuevo,
-      expira: Date.now() + 5 * 60 * 1000,
-      intentos: 0,
+    const pendingData = pendingRegistrations.get(tempToken);
+    if (!pendingData) {
+      return res.status(400).json({ 
+        error: "Sesión de registro inválida" 
+      });
+    }
+
+    // Generar nuevo código
+    const nuevoCodigo = genCodigo();
+    const userEmail = pendingData.userData.email;
+    
+    // Actualizar store temporal
+    pendingRegistrations.set(tempToken, {
+      ...pendingData,
+      codigo: nuevoCodigo,
+      expira: Date.now() + 5 * 60 * 1000, // Renovar 5 minutos
+      intentos: 0, // Resetear intentos
     });
 
-    await enviarCodigoEmail({ to: data.email, codigo: nuevo });
+    console.log(`Reenviando código 2FA a: ${userEmail}`);
+    await enviarCodigoEmail({ to: userEmail, codigo: nuevoCodigo });
 
     return res.json({
-      ok: true,
+      success: true,
+      mensaje: "Código reenviado exitosamente",
       canal: "email",
-      destino: maskEmail(data.email),
+      destino: maskEmail(userEmail),
     });
+
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Error al reenviar código" });
+    console.error("Error al reenviar código 2FA:", err);
+    res.status(500).json({ 
+      error: "Error interno al reenviar código" 
+    });
   }
 };
 
-// Exporta tu función original + nuevas 2FA
+// ====================
+// LIMPIAR REGISTROS PENDIENTES EXPIRADOS (opcional)
+// ====================
+const limpiarRegistrosExpirados = () => {
+  const now = Date.now();
+  for (const [token, data] of pendingRegistrations.entries()) {
+    if (now > data.expira) {
+      pendingRegistrations.delete(token);
+      console.log(`Registro pendiente expirado eliminado: ${token}`);
+    }
+  }
+};
+
+// Ejecutar limpieza cada hora
+setInterval(limpiarRegistrosExpirados, 60 * 60 * 1000);
+
 module.exports = {
   registerUser,
   verificarRegistro2FA,
